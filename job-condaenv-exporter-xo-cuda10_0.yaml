@@ -1,0 +1,66 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: $K8S_JOB_APPNAME
+spec:
+#  completions: 3
+#  parallelism: 3
+  template:
+    metadata:
+      labels:
+        app: $K8S_JOB_APPNAME
+        appgroup: $K8S_JOB_APPGROUP
+    spec:
+#      nodeName: tbox03.zyn.kr
+      containers:
+      - name: condaenv-exporter
+        image: registry.zyn.kr:6543/dataon.kr/condaenv-exporter:0.3.5-cuda10.0
+        resources:
+          requests:
+            nvidia.com/gpu: 1
+          limits:
+            nvidia.com/gpu: 1
+        volumeMounts:
+        - name: conda-pubenvs
+          mountPath: /opt/conda/pubenvs
+        - name: conda-usrenvs
+          mountPath: /opt/conda/usrenvs
+        - name: workspace
+          mountPath: /mnt/workspace
+        env:
+        - name: EXPORTMODE
+          value: $EXPORTMODE
+        - name: NB_USER
+          value: $NB_USER
+        - name: NB_UID
+          value: $NB_UID
+        - name: NB_GID
+          value: $NB_GID
+        - name: SRCENVNAME
+          value: $SRCENVNAME
+        - name: DSTENVNAME
+          value: $DSTENVNAME
+        - name: WETRUNARGS
+          value: $WETRUNARGS
+        - name: LOGFILE
+          value: $WETRUNLOGF
+        - name: LAP
+          value: "FALSE"
+        - name: CONDA_DEFAULT_THREADS
+          value: "10"
+        - name: ENABLESSHD
+          value: "TRUE"
+      volumes:
+      - name: conda-pubenvs
+        nfs:
+          server: ipa-k1805.zyn.kr
+          path: /home/xo/miniconda3/tmp
+      - name: conda-usrenvs
+        nfs:
+          server: ipa-k1805.zyn.kr
+          path: /home/xo/miniconda3/envs
+      - name: workspace
+        nfs:
+          server: ipa-k1805.zyn.kr
+          path: /home/xo
+      restartPolicy: Never
