@@ -1,12 +1,15 @@
 from cryptography.hazmat.primitives import serialization as crypto_serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, ed25519
 from cryptography.hazmat.backends import default_backend as crypto_default_backend
+from functools import partial
 import os
 import random
+import re
 import sys
 import time
 
 from kubernetes import client, config
+from kubernetes.stream import stream
 
 
 def JobTemplate(app_group: str = None, app_id: str = None,
@@ -40,6 +43,20 @@ def JobTemplate(app_group: str = None, app_id: str = None,
     return body
 
 
+def pod_exec(cmd=None, cmd_set=None, stdout=True, stderr=False, api=None, name=None, namespace=None):
+
+    if cmd is None:
+        _cmd = cmd_set
+    else:
+        _cmd = cmd.split(' ')
+        # exec_command = 'cat /etc/hosts'.split(' ')
+    resp = stream(api.connect_get_namespaced_pod_exec,
+                  name=name, namespace=namespace,
+                  command=_cmd,
+                  stderr=stdout, stdin=stderr, stdout=True, tty=False)
+    return resp
+
+
 def main():
 
     # safety-pin
@@ -54,8 +71,12 @@ def main():
     WETRUNARGS = sys.argv[5]
     WETRUNLOGF = sys.argv[6]
 
+    K8S_JOB_NAMESPACE = 'default'
     K8S_JOB_NAME_DEF = "conda-workflow"
     c8s_image_tag = "registry.zyn.kr:6543/dataon.kr/condaenv-exporter:0.3.5-cuda10.0"
+    enable_gpu = True
+    gpus_per_pod = 1
+    gpu_rsrc_name = 'nvidia.com/gpu'
 
     # random alphanumeric sequence template
     random_choice_seq = ''.join(str(idx) for idx in range(10)) + ''.join(chr(idx+97) for idx in range(26))
@@ -74,6 +95,8 @@ def main():
 
     key = ed25519.Ed25519PrivateKey.generate()
     prv_ed25519_key = key.private_bytes(
+        # encoding=crypto_serialization.Encoding.PEM,
+        # format=crypto_serialization.PrivateFormat.PKCS8,
         encoding=crypto_serialization.Encoding.PEM,
         format=crypto_serialization.PrivateFormat.PKCS8,
         encryption_algorithm=crypto_serialization.NoEncryption()
@@ -83,10 +106,11 @@ def main():
         format=crypto_serialization.PublicFormat.OpenSSH
     ).decode('UTF-8')
 
-    # print("----------")
-    # print(prv_ed25519_key)
-    # print("----------")
-    # print(pub_ed25519_key)
+    print("----------")
+    print(prv_ed25519_key)
+    print("----------")
+    print(pub_ed25519_key)
+    exit()
 
     list_k8s_volumes = [
         client.V1Volume(name="conda-pubenvs",
@@ -131,11 +155,11 @@ def main():
 
     for app_id in app_ids:
         job_object_body = JobTemplate(app_group=K8S_JOB_APPGROUP, app_id=app_id,
-                                      c8s_img=c8s_image_tag, enable_gpu=True, gpus_per_pod=1,
+                                      c8s_img=c8s_image_tag, enable_gpu=enable_gpu, gpus_per_pod=gpus_per_pod,
                                       list_k8s_volumes=list_k8s_volumes,
                                       list_c8s_vol_mntdest=list_c8s_vol_mntdest,
                                       list_env_vars=list_env_vars)
-        api_instance_batch.create_namespaced_job(namespace="default", body=job_object_body)
+        api_instance_batch.create_namespaced_job(namespace=K8S_JOB_NAMESPACE, body=job_object_body)
 
     while True:
         ret = api_instance_query.list_namespaced_pod(namespace="default", watch=False)
@@ -150,21 +174,91 @@ def main():
         if all_valid:
             break
         else:
-            time.sleep(3)
+            time.sleep(2)
             continue
 
     # after all success spawn
-    ret = api_instance_query.list_namespaced_pod(namespace="default", watch=False,
-                                                 label_selector='appgroup={:s}'.format(K8S_JOB_APPGROUP))
-    print('Listing pods with their IPs:')
-    for pod in ret.items:
-        print("{:s}\t{:s}\t{:s}".format(pod.metadata.name, pod.status.pod_ip, pod.status.phase))
+    str_etc_hosts = ''
+    str_etc_hostfile = ''
+    pattern = "([a-z0-9]+)-([a-z0-9]+)-([a-z0-9]+)-([a-z0-9]+)-([a-z0-9]+)"
 
-    time.sleep(10)
-    api_instance_batch.delete_collection_namespaced_job(namespace="default",
-                                                        label_selector='appgroup={:s}'.format(K8S_JOB_APPGROUP))
-    api_instance_query.delete_collection_namespaced_pod(namespace="default",
-                                                        label_selector='appgroup={:s}'.format(K8S_JOB_APPGROUP))
+    ret = api_instance_query.list_namespaced_pod(namespace=K8S_JOB_NAMESPACE, watch=False,
+                                                 label_selector='appgroup={:s}'.format(K8S_JOB_APPGROUP))
+
+    dict_appgroup = dict()
+    # print('Listing pods with their IPs:')
+    for pod in ret.items:
+        app_id = re.search(pattern, pod.metadata.name).group(4)
+        dict_appgroup.update({app_id: {
+            "object": pod,
+            "name": pod.metadata.name,
+            "ip": pod.status.pod_ip,
+            "phase": pod.status.phase,
+            "slots": pod.spec.containers[0].resources.requests[gpu_rsrc_name] if enable_gpu else "1"
+        }})
+
+    # upddate for manual resolve (/etc/hosts, /etc/hostfile)
+    for app_id in app_ids:
+        str_etc_hosts += "{:s}\t{:s}\t{:s}\n".format(dict_appgroup[app_id]['ip'],
+                                                     app_id, dict_appgroup[app_id]['name'])
+        str_etc_hostfile += "{:s}\tslots={:s}\n".format(app_id,
+                                                        dict_appgroup[app_id]['slots'])
+
+    for app_id in app_ids:
+        # reference: https://github.com/kubernetes-client/python/issues/878#issuecomment-511319318
+
+        fn_pod_exec = partial(pod_exec,
+                              api=api_instance_query,
+                              name=dict_appgroup[app_id]['name'],
+                              namespace=K8S_JOB_NAMESPACE, )
+
+        # get src hosts file
+        hosts_src = fn_pod_exec('cat /etc/hosts', )
+
+        # building new hosts file
+        list_hosts_items: list = hosts_src.split('\n')[:-2]
+        list_hosts_items.append('')
+        list_hosts_items.append('# MANUAL RESOLVE')
+        list_hosts_items.extend(str_etc_hosts.split('\n'))
+        hosts_new = '\n'.join(list_hosts_items)
+        cmd_set_update_hosts = ['bash', '-c',
+                                'cp /etc/hosts /etc/hosts.bkup;'+
+                                'echo "{:s}" >/etc/hosts;'.format(hosts_new)+
+                                'echo "{:s}" >/etc/hostfile;'.format(str_etc_hostfile)]
+        fn_pod_exec(cmd_set=cmd_set_update_hosts)
+
+        # building ssh credentials
+        sshcfg = '\n'.join([
+            'Host *', '    ServerAliveInterval 45', '    ServerAliveCountMax 1920', '    StrictHostKeyChecking no'
+        ])
+        cmd_set_update_sshkey = ['bash', '-c',
+                                 'mkdir -p /home/{:s}/.ssh;'.format(SU_USR)+
+                                 'echo "{:s}" >> /home/{:s}/.ssh/id_ed25519;'.format(prv_ed25519_key, SU_USR)+
+                                 'echo "{:s}" >> /home/{:s}/.ssh/id_ed25519.pub;'.format(pub_ed25519_key, SU_USR)+
+                                 'echo "{:s}" >> /home/{:s}/.ssh/authorized_keys;'.format(pub_ed25519_key, SU_USR)+
+                                 'echo "{:s}" >> /home/{:s}/.ssh/config;'.format(sshcfg, SU_USR)+
+                                 'chmod 600 /home/{:s}/.ssh/*;'.format(SU_USR)+
+                                 'chown -R {:s}:{:s} /home/{:s}/.ssh;'.format(SU_UID, SU_GID, SU_USR)]
+        # "mkdir -p /home/${SU_USR}/.ssh;" \
+        # "echo '$SSH_CRED_PUB' >> /home/${SU_USR}/.ssh/authorized_keys;" \
+        # "echo '$SSH_CRED_PUB' >> /home/${SU_USR}/.ssh/id_ed25519.pub;" \
+        # "echo '$SSH_CRED_PRV' >> /home/${SU_USR}/.ssh/id_ed25519;" \
+        # "echo 'Host *$IFS_NL    ServerAliveInterval 45$IFS_NL    ServerAliveCountMax 1920$IFS_NL    StrictHostKeyChecking no' >> /home/${SU_USR}/.ssh/config;" \
+        # "chmod 600 /home/${SU_USR}/.ssh/*;" \
+        # "chown -R $SU_UID:$SU_GID /home/${SU_USR}/.ssh;"
+        # print(fn_pod_exec("cat /etc/hosts"))
+        fn_pod_exec(cmd_set=cmd_set_update_sshkey)
+
+        continue
+
+    print("----------")
+
+    # final step for blowing jobs/pods
+    # time.sleep(10)
+    # api_instance_batch.delete_collection_namespaced_job(namespace="default",
+    #                                                     label_selector='appgroup={:s}'.format(K8S_JOB_APPGROUP))
+    # api_instance_query.delete_collection_namespaced_pod(namespace="default",
+    #                                                     label_selector='appgroup={:s}'.format(K8S_JOB_APPGROUP))
 
     # fin
     return
