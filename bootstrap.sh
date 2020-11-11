@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# safety-pin
+sleep 5
+
 # 00. initial setup
 export SU_USR=$1
 export SU_UID=$2
