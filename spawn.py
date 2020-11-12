@@ -137,9 +137,13 @@ def main():
     # random alphanumeric sequence template
     random_choice_seq = ''.join(str(idx) for idx in range(10)) + ''.join(chr(idx+97) for idx in range(26))
     K8S_JOB_POSTFIX = ''.join(random.choice(random_choice_seq) for _ in range(8))
+
+    # other configs
+    CONDAEVAL = 'eval "$(/opt/conda/bin/conda shell.bash hook)";'
     K8S_JOB_COUNTS = 3
     K8S_JOB_APPGROUP = "{:s}-{:s}".format(K8S_JOB_NAME_DEF, K8S_JOB_POSTFIX)
     K8S_JOB_INIT_TIMEOUT = 120
+    K8S_JOB_ARGS = "mpirun --hostfile /etc/hostfile -np {:d} bash -c '{:s}conda activate tf114;python workspace/horovod_test/tensorflow_mnist.py;'"
 
     # check input arguments
     print("{:s} - {:s} - {:s}".format(SU_USR, SU_UID, SU_GID))
@@ -301,11 +305,22 @@ def main():
         fn_pod_exec(cmd_set=cmd_set_update_sshkey)
 
         continue
+    del fn_pod_exec
 
+    print("----------")
+    fn_pod_exec = partial(pod_exec,
+                          api=k8s_apis['Core'],
+                          name=dict_appgroup['leader']['name'],
+                          namespace=K8S_JOB_NAMESPACE,)
+    cmd_set_job = [
+        'su', '-', SU_USR, '-c',
+        K8S_JOB_ARGS.format(K8S_JOB_COUNTS, CONDAEVAL)
+    ]
+    print(fn_pod_exec(cmd_set=cmd_set_job, stderr=True))
     print("----------")
 
     # final step for blowing jobs/pods
-    kill_appgroup(k8s_apis=k8s_apis, appgroup=K8S_JOB_APPGROUP, delay=90)
+    kill_appgroup(k8s_apis=k8s_apis, appgroup=K8S_JOB_APPGROUP, delay=40)
 
     # fin
     return
