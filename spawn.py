@@ -118,6 +118,8 @@ def main():
     sleep(3)
 
     # argv
+    # example:
+    # xo 606200001 606300000 py36tf114hvdgpu "/bin/sleep infinity" /dev/null
     SU_USR = sys.argv[1]
     SU_UID = sys.argv[2]
     SU_GID = sys.argv[3]
@@ -143,7 +145,23 @@ def main():
     K8S_JOB_COUNTS = 3
     K8S_JOB_APPGROUP = "{:s}-{:s}".format(K8S_JOB_NAME_DEF, K8S_JOB_POSTFIX)
     K8S_JOB_INIT_TIMEOUT = 120
-    K8S_JOB_ARGS = "mpirun --hostfile /etc/hostfile -np {:d} bash -c '{:s}conda activate tf114;python workspace/horovod_test/tensorflow_mnist.py;'"
+
+    LD_PRELOAD = 'LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libhwloc.so.5:/usr/lib/x86_64-linux-gnu/libjemalloc.so'
+    MPIRUN_ARGS_TEMPLATE = "mpirun -np {:d} --hostfile /etc/hostfile -x {:s}".format(K8S_JOB_COUNTS, LD_PRELOAD)
+    HVDRUN_ARGS_TEMPLATE = "horovodrun -np {:d} --hostfile /etc/hostfile {:s}".format(K8S_JOB_COUNTS, LD_PRELOAD)
+    JOB_ARGS = "python workspace/horovod_test/horovod_tensorflow_mnist_0_18_2.py;"
+
+    # method 1: invoke horovod by explicitly launch mpirun
+    MPIRUN_CMD_PREFAB = "bash -c '{:s}conda activate {:s};{:s}'"
+    K8S_JOB_ARGS = "{:s} {:}".format(MPIRUN_ARGS_TEMPLATE, MPIRUN_CMD_PREFAB.format(CONDAEVAL, SRCENVNAME, JOB_ARGS))
+
+    # method 2: invoke horovod by horovodrun as mpirun wrapper
+    # HVDRUN_CMD_PREFAB = "bash -c '{:s}conda activate {:s};{:s} {:s}'"
+    # K8S_JOB_ARGS = "{:s} {:s} {:s} {:s}".format(CONDAEVAL,
+    #                                             "conda activate {:s};".format(SRCENVNAME),
+    #                                             HVDRUN_ARGS_TEMPLATE,
+    #                                             HVDRUN_CMD_PREFAB.format(CONDAEVAL, SRCENVNAME, LD_PRELOAD, JOB_ARGS)
+    #                                             )
 
     # check input arguments
     print("{:s} - {:s} - {:s}".format(SU_USR, SU_UID, SU_GID))
@@ -240,7 +258,6 @@ def main():
                                                label_selector='appgroup={:s}'.format(K8S_JOB_APPGROUP))
 
     dict_appgroup = dict()
-    # print('Listing pods with their IPs:')
     for pod in ret.items:
         app_id = re.search(pattern, pod.metadata.name).group(4)
         try:
@@ -266,7 +283,6 @@ def main():
 
     for app_id in app_ids:
         # reference: https://github.com/kubernetes-client/python/issues/878#issuecomment-511319318
-
         fn_pod_exec = partial(pod_exec,
                               api=k8s_apis['Core'],
                               name=dict_appgroup[app_id]['name'],
@@ -303,8 +319,9 @@ def main():
             'chown -R {:s}:{:s} /home/{:s}/.ssh;'.format(SU_UID, SU_GID, SU_USR)
         ]
         fn_pod_exec(cmd_set=cmd_set_update_sshkey)
-
         continue
+
+    # blow-up partial function for re-use
     del fn_pod_exec
 
     print("----------")
@@ -312,15 +329,15 @@ def main():
                           api=k8s_apis['Core'],
                           name=dict_appgroup['leader']['name'],
                           namespace=K8S_JOB_NAMESPACE,)
-    cmd_set_job = [
-        'su', '-', SU_USR, '-c',
-        K8S_JOB_ARGS.format(K8S_JOB_COUNTS, CONDAEVAL)
-    ]
+    cmd_set_job = ['su', '-', SU_USR, '-c', K8S_JOB_ARGS]
     print(fn_pod_exec(cmd_set=cmd_set_job, stderr=True))
     print("----------")
 
+    # gold:
+    # mpirun -np 3 --hostfile /etc/hostfile -x LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libhwloc.so.5 - bash -c 'eval "$(/opt/conda/bin/conda shell.bash hook)";conda activate py36tf114hvdgpu;python workspace/horovod_test/horovod_tensorflow_mnist_0_18_2.py;'
+
     # final step for blowing jobs/pods
-    kill_appgroup(k8s_apis=k8s_apis, appgroup=K8S_JOB_APPGROUP, delay=40)
+    kill_appgroup(k8s_apis=k8s_apis, appgroup=K8S_JOB_APPGROUP, delay=0)
 
     # fin
     return
