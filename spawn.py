@@ -2,14 +2,45 @@ from cryptography.hazmat.primitives import serialization as crypto_serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, ed25519
 from cryptography.hazmat.backends import default_backend as crypto_default_backend
 from functools import partial
-import os
 import random
 import re
 import sys
-import time
+from time import sleep, time
 
 from kubernetes import client, config
 from kubernetes.stream import stream
+
+
+def ssh_keygen(type: str = 'rsa', decode2str: bool = True):
+
+    # very handy SSH prv/pub keygen
+    # references:
+    # - https://stackoverflow.com/a/39126754
+    # - https://cryptography.io/en/latest/hazmat/primitives/asymmetric/ed25519.html
+
+    if type == 'rsa':
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048,
+                                       backend=crypto_default_backend())
+
+    _key_private = key.private_bytes(
+        encoding=crypto_serialization.Encoding.PEM,
+        format=crypto_serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=crypto_serialization.NoEncryption()
+    )
+
+    _key_public = key.public_key().public_bytes(
+        encoding=crypto_serialization.Encoding.OpenSSH,
+        format=crypto_serialization.PublicFormat.OpenSSH
+    )
+
+    dict_keygen = {
+        'prv_fname': "id_{:s}".format(type),
+        'prv_key': _key_private.decode('UTF-8') if decode2str else _key_private,
+        'pub_fname': "id_{:s}.pub".format(type),
+        'pub_key': _key_public.decode('UTF-8') if decode2str else _key_public,
+    }
+
+    return dict_keygen
 
 
 def JobTemplate(app_group: str = None, app_id: str = None,
@@ -57,10 +88,34 @@ def pod_exec(cmd=None, cmd_set=None, stdout=True, stderr=False, api=None, name=N
     return resp
 
 
+def kill_appgroup(k8s_apis, appgroup, delay: float or int = 0):
+
+    if delay > 0:
+        sleep(delay)
+    else:
+        pass
+
+    try:
+        k8s_apis['Batch'].delete_collection_namespaced_job(
+            namespace="default", label_selector='appgroup={:s}'.format(appgroup))
+    except KeyError:
+        pass
+    try:
+        k8s_apis['Core'].delete_collection_namespaced_pod(
+            namespace="default", label_selector='appgroup={:s}'.format(appgroup))
+    except KeyError:
+        pass
+
+    exit(0)
+
+    # fin
+    return
+
+
 def main():
 
     # safety-pin
-    time.sleep(3)
+    sleep(3)
 
     # argv
     SU_USR = sys.argv[1]
@@ -76,6 +131,7 @@ def main():
     c8s_image_tag = "registry.zyn.kr:6543/dataon.kr/condaenv-exporter:0.3.5-cuda10.0"
     enable_gpu = True
     gpus_per_pod = 1
+    # gpu_rsrc_name = 'amd.com/gpu'
     gpu_rsrc_name = 'nvidia.com/gpu'
 
     # random alphanumeric sequence template
@@ -83,34 +139,13 @@ def main():
     K8S_JOB_POSTFIX = ''.join(random.choice(random_choice_seq) for _ in range(8))
     K8S_JOB_COUNTS = 3
     K8S_JOB_APPGROUP = "{:s}-{:s}".format(K8S_JOB_NAME_DEF, K8S_JOB_POSTFIX)
+    K8S_JOB_INIT_TIMEOUT = 120
 
     # check input arguments
     print("{:s} - {:s} - {:s}".format(SU_USR, SU_UID, SU_GID))
     print("{:s}".format(K8S_JOB_APPGROUP))
 
-    # very handy SSH prv/pub keygen
-    # references:
-    # - https://stackoverflow.com/a/39126754
-    # - https://cryptography.io/en/latest/hazmat/primitives/asymmetric/ed25519.html
-
-    key = ed25519.Ed25519PrivateKey.generate()
-    prv_ed25519_key = key.private_bytes(
-        # encoding=crypto_serialization.Encoding.PEM,
-        # format=crypto_serialization.PrivateFormat.PKCS8,
-        encoding=crypto_serialization.Encoding.PEM,
-        format=crypto_serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=crypto_serialization.NoEncryption()
-    ).decode('UTF-8')
-    pub_ed25519_key = key.public_key().public_bytes(
-        encoding=crypto_serialization.Encoding.OpenSSH,
-        format=crypto_serialization.PublicFormat.OpenSSH
-    ).decode('UTF-8')
-
-    print("----------")
-    print(prv_ed25519_key)
-    print("----------")
-    print(pub_ed25519_key)
-    exit()
+    dict_keygen = ssh_keygen(type='rsa')
 
     list_k8s_volumes = [
         client.V1Volume(name="conda-pubenvs",
@@ -148,10 +183,13 @@ def main():
         client.V1EnvVar(name="ENABLESSHD", value="TRUE")
     ]
 
+    # init k8s client & apis
     config.load_kube_config()
-    api_instance_batch = client.BatchV1Api()
-    api_instance_query = client.CoreV1Api()
-    app_ids = ['leader', 'worker1', 'worker2']
+    k8s_apis = {'Batch': client.BatchV1Api(), 'Core': client.CoreV1Api()}
+
+    # set hosts & workers (num: total job count-1)
+    app_ids = ['leader']
+    app_ids.extend(["worker{:d}".format(idx+1) for idx in range(K8S_JOB_COUNTS-1)])
 
     for app_id in app_ids:
         job_object_body = JobTemplate(app_group=K8S_JOB_APPGROUP, app_id=app_id,
@@ -159,10 +197,17 @@ def main():
                                       list_k8s_volumes=list_k8s_volumes,
                                       list_c8s_vol_mntdest=list_c8s_vol_mntdest,
                                       list_env_vars=list_env_vars)
-        api_instance_batch.create_namespaced_job(namespace=K8S_JOB_NAMESPACE, body=job_object_body)
+        k8s_apis['Batch'].create_namespaced_job(namespace=K8S_JOB_NAMESPACE, body=job_object_body)
 
+    # waiting for all elems in appgroup is okay and literally 'Running'
+    t_start = None
     while True:
-        ret = api_instance_query.list_namespaced_pod(namespace="default", watch=False)
+        if t_start is None:
+            t_start = time()
+        else:
+            pass
+
+        ret = k8s_apis['Core'].list_namespaced_pod(namespace="default", watch=False)
         all_valid = True
         for pod in ret.items:
             if pod.status.phase.lower() == 'running':
@@ -170,11 +215,16 @@ def main():
             else:
                 all_valid = False
                 break
-
         if all_valid:
             break
         else:
-            time.sleep(2)
+            # check timeout reach
+            if abs(time()-t_start) >= K8S_JOB_INIT_TIMEOUT:
+                print('[E] Timeout reached.\nQuitting...')
+                kill_appgroup(k8s_apis=k8s_apis, appgroup=K8S_JOB_APPGROUP)
+            else:
+                # if any elem is not okay, wait 2 secs and loop again
+                sleep(2)
             continue
 
     # after all success spawn
@@ -182,19 +232,25 @@ def main():
     str_etc_hostfile = ''
     pattern = "([a-z0-9]+)-([a-z0-9]+)-([a-z0-9]+)-([a-z0-9]+)-([a-z0-9]+)"
 
-    ret = api_instance_query.list_namespaced_pod(namespace=K8S_JOB_NAMESPACE, watch=False,
-                                                 label_selector='appgroup={:s}'.format(K8S_JOB_APPGROUP))
+    ret = k8s_apis['Core'].list_namespaced_pod(namespace=K8S_JOB_NAMESPACE, watch=False,
+                                               label_selector='appgroup={:s}'.format(K8S_JOB_APPGROUP))
 
     dict_appgroup = dict()
     # print('Listing pods with their IPs:')
     for pod in ret.items:
         app_id = re.search(pattern, pod.metadata.name).group(4)
+        try:
+            mpi_slots = pod.spec.containers[0].resources.requests[gpu_rsrc_name] if enable_gpu else "1"
+        except KeyError:
+            print('[E] current spawn status does not meet pre-defined requirements.\nQuitting...')
+            kill_appgroup(k8s_apis=k8s_apis, appgroup=K8S_JOB_APPGROUP)
+            mpi_slots = None
         dict_appgroup.update({app_id: {
             "object": pod,
             "name": pod.metadata.name,
             "ip": pod.status.pod_ip,
             "phase": pod.status.phase,
-            "slots": pod.spec.containers[0].resources.requests[gpu_rsrc_name] if enable_gpu else "1"
+            "slots": mpi_slots
         }})
 
     # upddate for manual resolve (/etc/hosts, /etc/hostfile)
@@ -208,10 +264,9 @@ def main():
         # reference: https://github.com/kubernetes-client/python/issues/878#issuecomment-511319318
 
         fn_pod_exec = partial(pod_exec,
-                              api=api_instance_query,
+                              api=k8s_apis['Core'],
                               name=dict_appgroup[app_id]['name'],
                               namespace=K8S_JOB_NAMESPACE, )
-
         # get src hosts file
         hosts_src = fn_pod_exec('cat /etc/hosts', )
 
@@ -221,32 +276,28 @@ def main():
         list_hosts_items.append('# MANUAL RESOLVE')
         list_hosts_items.extend(str_etc_hosts.split('\n'))
         hosts_new = '\n'.join(list_hosts_items)
-        cmd_set_update_hosts = ['bash', '-c',
-                                'cp /etc/hosts /etc/hosts.bkup;'+
-                                'echo "{:s}" >/etc/hosts;'.format(hosts_new)+
-                                'echo "{:s}" >/etc/hostfile;'.format(str_etc_hostfile)]
+        cmd_set_update_hosts = [
+            'bash', '-c',
+            'cp /etc/hosts /etc/hosts.bkup;' +
+            'echo "{:s}" >/etc/hosts;'.format(hosts_new) +
+            'echo "{:s}" >/etc/hostfile;'.format(str_etc_hostfile)
+        ]
         fn_pod_exec(cmd_set=cmd_set_update_hosts)
 
         # building ssh credentials
         sshcfg = '\n'.join([
             'Host *', '    ServerAliveInterval 45', '    ServerAliveCountMax 1920', '    StrictHostKeyChecking no'
         ])
-        cmd_set_update_sshkey = ['bash', '-c',
-                                 'mkdir -p /home/{:s}/.ssh;'.format(SU_USR)+
-                                 'echo "{:s}" >> /home/{:s}/.ssh/id_ed25519;'.format(prv_ed25519_key, SU_USR)+
-                                 'echo "{:s}" >> /home/{:s}/.ssh/id_ed25519.pub;'.format(pub_ed25519_key, SU_USR)+
-                                 'echo "{:s}" >> /home/{:s}/.ssh/authorized_keys;'.format(pub_ed25519_key, SU_USR)+
-                                 'echo "{:s}" >> /home/{:s}/.ssh/config;'.format(sshcfg, SU_USR)+
-                                 'chmod 600 /home/{:s}/.ssh/*;'.format(SU_USR)+
-                                 'chown -R {:s}:{:s} /home/{:s}/.ssh;'.format(SU_UID, SU_GID, SU_USR)]
-        # "mkdir -p /home/${SU_USR}/.ssh;" \
-        # "echo '$SSH_CRED_PUB' >> /home/${SU_USR}/.ssh/authorized_keys;" \
-        # "echo '$SSH_CRED_PUB' >> /home/${SU_USR}/.ssh/id_ed25519.pub;" \
-        # "echo '$SSH_CRED_PRV' >> /home/${SU_USR}/.ssh/id_ed25519;" \
-        # "echo 'Host *$IFS_NL    ServerAliveInterval 45$IFS_NL    ServerAliveCountMax 1920$IFS_NL    StrictHostKeyChecking no' >> /home/${SU_USR}/.ssh/config;" \
-        # "chmod 600 /home/${SU_USR}/.ssh/*;" \
-        # "chown -R $SU_UID:$SU_GID /home/${SU_USR}/.ssh;"
-        # print(fn_pod_exec("cat /etc/hosts"))
+        cmd_set_update_sshkey = [
+            'bash', '-c',
+            'mkdir -p /home/{:s}/.ssh;'.format(SU_USR) +
+            'echo "{:s}" >> /home/{:s}/.ssh/{:s};'.format(dict_keygen['prv_key'], SU_USR, dict_keygen['prv_fname']) +
+            'echo "{:s}" >> /home/{:s}/.ssh/{:s};'.format(dict_keygen['pub_key'], SU_USR, dict_keygen['pub_fname']) +
+            'echo "{:s}" >> /home/{:s}/.ssh/authorized_keys;'.format(dict_keygen['pub_key'], SU_USR) +
+            'echo "{:s}" >> /home/{:s}/.ssh/config;'.format(sshcfg, SU_USR) +
+            'chmod 600 /home/{:s}/.ssh/*;'.format(SU_USR) +
+            'chown -R {:s}:{:s} /home/{:s}/.ssh;'.format(SU_UID, SU_GID, SU_USR)
+        ]
         fn_pod_exec(cmd_set=cmd_set_update_sshkey)
 
         continue
@@ -254,11 +305,7 @@ def main():
     print("----------")
 
     # final step for blowing jobs/pods
-    # time.sleep(10)
-    # api_instance_batch.delete_collection_namespaced_job(namespace="default",
-    #                                                     label_selector='appgroup={:s}'.format(K8S_JOB_APPGROUP))
-    # api_instance_query.delete_collection_namespaced_pod(namespace="default",
-    #                                                     label_selector='appgroup={:s}'.format(K8S_JOB_APPGROUP))
+    kill_appgroup(k8s_apis=k8s_apis, appgroup=K8S_JOB_APPGROUP, delay=90)
 
     # fin
     return
