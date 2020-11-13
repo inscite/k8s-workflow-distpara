@@ -1,5 +1,5 @@
 from cryptography.hazmat.primitives import serialization as crypto_serialization
-from cryptography.hazmat.primitives.asymmetric import rsa, ed25519
+from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.backends import default_backend as crypto_default_backend
 from functools import partial
 import random
@@ -9,6 +9,11 @@ from time import sleep, time
 
 from kubernetes import client, config
 from kubernetes.stream import stream
+
+
+"""Copyright (c) 2020 Seungkyun Hong. <nah@kakao.com>
+   Distributed under the terms of the 3-Clause BSD License.
+"""
 
 
 def ssh_keygen(type: str = 'rsa', decode2str: bool = True):
@@ -81,10 +86,14 @@ def pod_exec(cmd=None, cmd_set=None, stdout=True, stderr=False, api=None, name=N
     else:
         _cmd = cmd.split(' ')
         # exec_command = 'cat /etc/hosts'.split(' ')
-    resp = stream(api.connect_get_namespaced_pod_exec,
-                  name=name, namespace=namespace,
-                  command=_cmd,
-                  stderr=stdout, stdin=stderr, stdout=True, tty=False)
+    try:
+        resp = stream(api.connect_get_namespaced_pod_exec,
+                      name=name, namespace=namespace,
+                      command=_cmd,
+                      stderr=stdout, stdin=stderr, stdout=True, tty=False)
+    except client.ApiException:
+        resp = None
+
     return resp
 
 
@@ -148,12 +157,21 @@ def main():
 
     LD_PRELOAD = 'LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libhwloc.so.5:/usr/lib/x86_64-linux-gnu/libjemalloc.so'
     MPIRUN_ARGS_TEMPLATE = "mpirun -np {:d} --hostfile /etc/hostfile -x {:s}".format(K8S_JOB_COUNTS, LD_PRELOAD)
-    HVDRUN_ARGS_TEMPLATE = "horovodrun -np {:d} --hostfile /etc/hostfile {:s}".format(K8S_JOB_COUNTS, LD_PRELOAD)
-    JOB_ARGS = "python workspace/horovod_test/horovod_tensorflow_mnist_0_18_2.py;"
+    MPIRUN_ARGS_WORKERSONLY_TEMPLATE = "mpirun -np {:d} --hostfile /etc/hostfile_workers -x {:s}".format(
+        K8S_JOB_COUNTS-1, LD_PRELOAD)
+    # HVDRUN_ARGS_TEMPLATE = "horovodrun -np {:d} --hostfile /etc/hostfile {:s}".format(K8S_JOB_COUNTS, LD_PRELOAD)
+    CLEANUP_TEMPLATE = "kill -SIGTERM $(cat /var/run/wetrun.pid)"
+    # must finish without semi-colon
+    JOB_ARGS = "python workspace/horovod_test/horovod_tensorflow_mnist_0_18_2.py"
 
     # method 1: invoke horovod by explicitly launch mpirun
-    MPIRUN_CMD_PREFAB = "bash -c '{:s}conda activate {:s};{:s}'"
-    K8S_JOB_ARGS = "{:s} {:}".format(MPIRUN_ARGS_TEMPLATE, MPIRUN_CMD_PREFAB.format(CONDAEVAL, SRCENVNAME, JOB_ARGS))
+    MPIRUN_CMD_PREFAB = "bash -c '{:s}conda activate {:s};{:s};'"
+    K8S_JOB_ARGS = "{:s} {:s}; {:s} {:s}; {:s};".format(
+        MPIRUN_ARGS_TEMPLATE,
+        MPIRUN_CMD_PREFAB.format(CONDAEVAL, SRCENVNAME, JOB_ARGS),
+        MPIRUN_ARGS_WORKERSONLY_TEMPLATE,
+        MPIRUN_CMD_PREFAB.format(CONDAEVAL, SRCENVNAME, CLEANUP_TEMPLATE),
+        CLEANUP_TEMPLATE)
 
     # method 2: invoke horovod by horovodrun as mpirun wrapper
     # HVDRUN_CMD_PREFAB = "bash -c '{:s}conda activate {:s};{:s} {:s}'"
@@ -252,6 +270,7 @@ def main():
     # after all success spawn
     str_etc_hosts = ''
     str_etc_hostfile = ''
+    str_etc_hostfile_workers = ''
     pattern = "([a-z0-9]+)-([a-z0-9]+)-([a-z0-9]+)-([a-z0-9]+)-([a-z0-9]+)"
 
     ret = k8s_apis['Core'].list_namespaced_pod(namespace=K8S_JOB_NAMESPACE, watch=False,
@@ -277,9 +296,17 @@ def main():
     # upddate for manual resolve (/etc/hosts, /etc/hostfile)
     for app_id in app_ids:
         str_etc_hosts += "{:s}\t{:s}\t{:s}\n".format(dict_appgroup[app_id]['ip'],
-                                                     app_id, dict_appgroup[app_id]['name'])
+                                                     app_id,
+                                                     dict_appgroup[app_id]['name'])
+
         str_etc_hostfile += "{:s}\tslots={:s}\n".format(app_id,
                                                         dict_appgroup[app_id]['slots'])
+        if app_id != 'leader':
+            str_etc_hostfile_workers += "{:s}\tslots={:s}\n".format(app_id,
+                                                                    dict_appgroup[app_id]['slots'])
+        else:
+            pass
+        continue
 
     for app_id in app_ids:
         # reference: https://github.com/kubernetes-client/python/issues/878#issuecomment-511319318
@@ -300,7 +327,8 @@ def main():
             'bash', '-c',
             'cp /etc/hosts /etc/hosts.bkup;' +
             'echo "{:s}" >/etc/hosts;'.format(hosts_new) +
-            'echo "{:s}" >/etc/hostfile;'.format(str_etc_hostfile)
+            'echo "{:s}" >/etc/hostfile;'.format(str_etc_hostfile) +
+            'echo "{:s}" >/etc/hostfile_workers;'.format(str_etc_hostfile_workers)
         ]
         fn_pod_exec(cmd_set=cmd_set_update_hosts)
 
@@ -333,11 +361,8 @@ def main():
     print(fn_pod_exec(cmd_set=cmd_set_job, stderr=True))
     print("----------")
 
-    # gold:
-    # mpirun -np 3 --hostfile /etc/hostfile -x LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libhwloc.so.5 - bash -c 'eval "$(/opt/conda/bin/conda shell.bash hook)";conda activate py36tf114hvdgpu;python workspace/horovod_test/horovod_tensorflow_mnist_0_18_2.py;'
-
-    # final step for blowing jobs/pods
-    kill_appgroup(k8s_apis=k8s_apis, appgroup=K8S_JOB_APPGROUP, delay=0)
+    # final step for manually blowing spawned jobs/pods (only for debugging)
+    # kill_appgroup(k8s_apis=k8s_apis, appgroup=K8S_JOB_APPGROUP, delay=10)
 
     # fin
     return
