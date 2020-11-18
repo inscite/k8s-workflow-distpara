@@ -16,7 +16,7 @@ $ python spawn.py $SU_USR $SU_UID $SU_GID $SRCENVNAME $HOOKCMD $LOGFILE
 * **HOOKCMD**: **"/bin/sleep infinity"**
 * **LOGFILE**: destination for logfile, currently not used
 
-##example:
+## example:
 
 ```console
 $ python spawn.py xo 606200001 606300000 py36tf114hvdgpu "/bin/sleep infinity" /dev/null
